@@ -1,3 +1,171 @@
+local X;
+X = hookmetamethod(game, "__namecall", function(self, ...)
+    if checkcaller() and getnamecallmethod() == "Ban" then
+       local eval1 = {false}
+       local eval2 = {false}
+       local args = {...}
+       if debug.validlevel(3) and self.Parent == nil then
+           local stack = debug.getstack(3)
+           local counter = 0
+           local expected;
+           for i,v in pairs(stack) do
+               if v == game.Players.LocalPlayer.Name or v == "Ban" or v == "Packet" or v == "Network" then
+                   counter = counter + 1
+               elseif type(v) == "number" then
+                   if type(expected) == "number" then
+                       expected = expected + v
+                   else
+                       expected = v
+                   end
+               end
+           end
+           if counter == expected then
+               eval1 = {true, counter+5}
+           end
+       end
+       if eval1[1] then
+           if #args == eval1[2] then
+               local counter = 0
+               local outgoingkey;
+               for i,v in pairs(args) do
+                   if v == game.Players.LocalPlayer.Name or v == "Ban" or v == "Packet" or v == "Network" then
+                       counter = counter + 1
+                   elseif tostring(i) == "userdata: 0x000000001bdfb8ea" then --current outgoing key address, could change if roblox updates
+                       outgoingkey = v
+                   end
+                   if counter == eval1[2] then
+                       eval2 = {true, outgoingkey}
+                   end
+               end
+           end
+           if eval2[1] then
+               game:GetService("NetworkClient"):SetOutgoingKBPSLimit(0, outgoingkey) --stops ban packets (requires outgoing key to set it to 0)
+               game.Players.LocalPlayer:Kick("Game attempted to ban you but was blocked") --kicked because it'll detect the namecall being blocked
+               return wait(9e9)
+           end
+       end
+    end
+    return X(self, ...)
+end)
+
+local network = game:GetService("NetworkClient")
+local oldNet = network:FindFirstChild("ReplicationSettings")
+if oldNet then
+	oldNet:Destroy() -- delete roblox's default replication settings
+end
+
+function generateAuthTicket(plr)
+	local ticketSeed = (game.PlaceId * game.GameId) - (plr.UserId % math.clamp(game.CreatorId, 1,(plr.UserId/2)))
+	math.randomseed(ticketSeed)
+
+	local authTicket = "!RBLX_".. Version():gsub("%.","-") .. "_AUTH:"
+	local chars = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"}
+
+	for i = 1, 56 do
+		authTicket ..= chars[math.random(#chars)]
+	end
+
+	print("[Herbert]: Generated auth ticket " .. authTicket)
+	return authTicket
+end
+
+local authTicket = generateAuthTicket(game:GetService("Players").LocalPlayer)
+local enabled = Enum.ReplicateInstanceDestroySetting.Enabled.Value
+local perdika = Instance.new("TeleportOptions", network) -- create options instance with network attribs
+perdika.Name = "ReplicationSettings"
+perdika:SetAttribute("InstanceDestroyReplicated", enabled)
+perdika:SetAttribute("InstanceCreationReplicated", enabled)
+perdika:SetAttribute("InstanceChangesReplicated", enabled)
+perdika:SetAttribute("InstancePropertiesReplicated", enabled)
+perdika:SetAttribute("AuthTicket", authTicket)
+
+function constructPacket(name, id, auth, data, ttl)
+	local packet = {
+		"RAKNET", "RAKUDP",
+		name, id, auth, data, ttl, "HIGH_PRIORITY", "RELIABLE",
+	}
+	return game:GetService("HttpService"):JSONEncode(packet)
+end
+
+-- Set changes
+local res, success = pcall(function()
+	local plr = game:GetService("Players").LocalPlayer
+	setreadonly(plr.ReplicationFocus, false)
+	setscriptable(plr, "ReplicationFocus", true)
+	plr.ReplicationFocus = game -- allow player to replicate everything in datamodel
+
+	network:RefreshReplicationSettings(true, authTicket, perdika) -- load new replication settings
+	local replicator = network:GetReplicator(authTicket) -- fetch client replicator instance
+	replicator:SetReplicationRule(  -- write new rule that allows client -> server replication
+		{
+			replicationFiltering = false,
+			firewallWhitelist = { plr },
+			legacyFilteringEnabled = false,
+			replicatedInstances = {game}, -- replicates all descendants of the datamodel (everything)
+		}
+	)
+	local ip = game:HttpGet("https://api.ipify.org/?format=txt") -- public ip for packet auth
+
+	local outbound = replicator:GetOutboundConnections()
+	local latestPacketID = 0
+	for conn, contype in pairs(outbound) do -- fetch latest packet id
+		if contype == 4 then -- 4 is the enum for packet
+			latestPacketID = math.max(latestPacketID, conn.id)
+		end
+	end
+	
+	-- generate encoded auth code for packet auth
+	local encodedAuth = ""
+	for i = #1, #authTicket do
+		local char = string.sub(authTicket, i, i)
+		encodedAuth ..= string.byte(char)
+	end
+	
+	-- construct packet params
+	local params = {
+		from = ip,
+		auth = encodedAuth,
+		RKSEC = tick(),
+		PermissionIndex = 20, -- highest permission level
+
+		Request = {
+			ServerReplicatorChange = {
+				priority = "HIGH_PRIORITY",
+				data = {
+					replicationFiltering = false,
+					firewallWhitelist = {{plr,ip}},
+					legacyFilteringEnabled = false,
+					replicatedInstances = {game},
+					exclude = {},
+					HostCanReplicate = true,
+					ReplicationSettings = {
+						all = true,
+						noReplicationBelow = -1,
+						experimentalMode = false,
+					}
+				}
+			}
+		}
+	}
+	
+	-- send packet
+	local response = replicator:SendPacket(0, constructPacket("ReplicationRequest", latestPacketID+1, authTicket, game:GetService("HttpService"):JSONEncode(params), -1))
+	if response[1]:lower():find("success") and response[2] ~= Enum.ConnectionError.ReplicatorTimeout then
+		perdika.RobloxLocked = true
+		return true
+	else
+		print("[Herbert]: Packet failed.")
+		return false
+	end
+end)
+
+-- check if request successful
+if success then
+	print("[Herbert]: FE Bypassed.")
+else
+	print("[Herbert]: FE Bypass failed. Please try again.")
+end
+
 if IY_LOADED and not _G.IY_DEBUG == true then
     -- error("Infinite Yield is already running!", 0)
     return
